@@ -1,22 +1,19 @@
+use anyhow::{Context, Result};
 use core::fmt::{self, Debug};
 use std::path::PathBuf;
-use anyhow::{Context, Result};
+use std::time::Instant;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::{WasiCtx, WasiView, ResourceTable};
-use std::time::Instant;
-
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiView};
 
 wasmtime::component::bindgen!({
-    path: "../wit", 
+    path: "../wit",
     world: "reconciler",
     async: true,
     with: {
         "wasi:io": wasmtime_wasi::bindings::io,
     },
 });
-
-
 
 /// This state is used by the Runtime host,
 /// we use it to store the WASI context (implementations of WASI)
@@ -32,9 +29,7 @@ struct Ctx {
 
 impl Ctx {
     pub fn new() -> Self {
-        let wasi = WasiCtx::builder()
-            .inherit_stdio()
-            .build();
+        let wasi = WasiCtx::builder().inherit_stdio().build();
         Self {
             wasi,
             table: ResourceTable::new(),
@@ -46,13 +41,7 @@ impl ReconcilerImports for Ctx {
     fn get<'life0, 'async_trait>(
         &'life0 mut self,
         name: String,
-    ) -> ::core::pin::Pin<
-        Box<
-            dyn ::core::future::Future<
-                Output = String,
-            > + Send + 'async_trait,
-        >,
-    >
+    ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = String> + Send + 'async_trait>>
     where
         'life0: 'async_trait,
         Self: 'async_trait,
@@ -80,22 +69,17 @@ impl Debug for Ctx {
     }
 }
 
-
 /// load the WASM component and return the instance
-async fn load_reconciler_instance(
-    path: PathBuf,
-) -> Result<(Store<Ctx>, Reconciler)> {
+async fn load_reconciler_instance(path: PathBuf) -> Result<(Store<Ctx>, Reconciler)> {
     // Initialize the Wasmtime engine
     let mut engine_config = Config::default();
-    engine_config.async_support( true);
-    engine_config.wasm_component_model( true);
+    engine_config.async_support(true);
+    engine_config.wasm_component_model(true);
 
-    let engine = Engine::new(&engine_config)
-        .context("cannot create engine from config")?;
+    let engine = Engine::new(&engine_config).context("cannot create engine from config")?;
 
     // Load the WASM component
-    let component = Component::from_file(&engine, &path)
-        .context("Component file not found")?;
+    let component = Component::from_file(&engine, &path).context("Component file not found")?;
 
     // Create the store to manage the state of the component
     let states: Ctx = Ctx::new();
@@ -106,7 +90,7 @@ async fn load_reconciler_instance(
 
     // Add WASI implementations to the linker for components to use
     wasmtime_wasi::add_to_linker_async(&mut linker)
-        .context("failed to link core WASI interfaces")?;   
+        .context("failed to link core WASI interfaces")?;
 
     //wasmtime_wasi::bindings::io::error::add_to_linker(&mut linker, |ctx| ctx)
     //    .context("failed to link wasi")?;
@@ -118,8 +102,7 @@ async fn load_reconciler_instance(
     //    .context("failed to link wasi")?;
 
     // Add the `Reconciler` interface to the linker
-    Reconciler::add_to_linker(&mut linker, |ctx| ctx)
-        .context("failed to link reconciler")?;
+    Reconciler::add_to_linker(&mut linker, |ctx| ctx).context("failed to link reconciler")?;
 
     // Instantiate the component
     let instance = Reconciler::instantiate_async(&mut store, &component, &linker)
@@ -147,7 +130,6 @@ async fn call_reconcile(
     Ok(result)
 }
 
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let wasm_path = PathBuf::from(
@@ -164,23 +146,32 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Error loading reconciler instance: {}", e))?;
 
-   // Measure time taken to run the instance 10 times
+    // Measure time taken to run the instance 10 times
     let start = Instant::now();
 
     for i in 0..10 {
         println!("Running iteration: {}", i + 1);
-         // Measure iteration time
+        // Measure iteration time
         let iteration_start = Instant::now();
         match call_reconcile(&mut store, &instance, input_json.clone()).await {
             Ok(result) => {
                 let iteration_duration = iteration_start.elapsed();
-                println!("Reconcile Iteration {} succeeded with output: {:#?}", i, result);
-                println!("Reconcile Iteration {} elaspetime {:?}", i, iteration_duration);
+                println!(
+                    "Reconcile Iteration {} succeeded with output: {:#?}",
+                    i, result
+                );
+                println!(
+                    "Reconcile Iteration {} elaspetime {:?}",
+                    i, iteration_duration
+                );
             }
             Err(e) => {
                 let iteration_duration = iteration_start.elapsed();
                 eprintln!("Reconcile Iteration {} failed: {}", i, e);
-                println!("Reconcile Iteration {} elaspetime {:?}", i, iteration_duration);
+                println!(
+                    "Reconcile Iteration {} elaspetime {:?}",
+                    i, iteration_duration
+                );
             }
         }
     }
