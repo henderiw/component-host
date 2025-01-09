@@ -37,13 +37,26 @@ struct Ctx {
 
 impl Ctx {
     pub fn new() -> Self {
-        // NOTE: even though we inherit the host environment here (which would normally expose *ALL* env vars to the component)
-        // at *link time* (when we are setting up the linker), we *force* the use of the implementation on `Ctx`, not `WasiCtx`
+        // NOTE: `inherit_env()` causes all the host environment variables to be visible to the host,
+        // and if you use the WASI implementation provided (by wasmtime_wasi), all env vars would be
+        // available to all components.
         //
-        // It would be a better idea to use the line below where we don't inherit_env at all, to be double-sure
-        // we'll always use the custom impl on `Ctx`
+        // What this code does (later in `main`) is control this exposure at *link* time, but
+        // having the implementation filled by `Ctx` *not* the `Ctx#wasi` (which is a `WasiCtx`).
         //
-        //let wasi = WasiCtx::builder().inherit_stdio().build();
+        // This means that rather than go to the default code (provided by wasmtime_wasi), the linker hit the
+        // implementation in this file attached to `Ctx`.
+        //
+        // If we knew we want to *never* use the underlying host's ENV, it would be a better idea to
+        // remove the `inherit_env()` completely.
+        //
+        // The advantage of this setup is that you can have dynamic, filtered, or mediated access
+        // to the host environment -- from the impl on `Ctx` -- this means that you could expose a filtered
+        // list of environment variables that were available at host startup, nothing, or anything in between.
+        //
+        // You could do something like only allowing access to the full list of ENV variables *once* for a component,
+        // and all you would need is some extra state on `Ctx`.
+        //
         let wasi = WasiCtx::builder().inherit_stdio().inherit_env().build();
         Self {
             wasi,
@@ -52,15 +65,9 @@ impl Ctx {
     }
 }
 
-// NOTE: you need to use async_trait mostly because that's what the bindings use
-//
-// Unfortunately auto-complete/ cargo-expand will show you a trait *after* async_trait
-// has had it's way with it -- so that's why you get obtusely named lifetimes and hard
-// to read code for humans.
-#[async_trait]
-impl bindings::example::reconciler::retrieve::Host for Ctx {
-    async fn get(&mut self, s: String) -> String {
-        format!("Hello {s}!")
+impl Debug for Ctx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ctx").field("runtime", &"wasmtime").finish()
     }
 }
 
@@ -74,7 +81,8 @@ impl WasiView for Ctx {
     }
 }
 
-// Custom implementation of *only* the environment bit of
+
+/// Custom implementation of *only* the environment bit of
 /// wasi:cli, for our Host context object (`Ctx`)
 impl wasmtime_wasi::bindings::cli::environment::Host for Ctx {
     fn get_environment(&mut self) -> wasmtime::Result<Vec<(String, String)>> {
@@ -91,24 +99,16 @@ impl wasmtime_wasi::bindings::cli::environment::Host for Ctx {
     }
 }
 
-impl Debug for Ctx {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Ctx").field("runtime", &"wasmtime").finish()
+// NOTE: you need to use async_trait mostly because that's what the bindings use
+//
+// Unfortunately auto-complete/ cargo-expand will show you a trait *after* async_trait
+// has had it's way with it -- so that's why you get obtusely named lifetimes and hard
+// to read code for humans.
+#[async_trait]
+impl bindings::example::reconciler::retrieve::Host for Ctx {
+    async fn get(&mut self, s: String) -> String {
+        format!("Hello {s}!")
     }
-}
-
-fn type_annotate<T: WasiView, F>(val: F) -> F
-where
-    F: Fn(&mut T) -> WasiImpl<&mut T>,
-{
-    val
-}
-
-fn type_annotate_plain<T: WasiView, F>(val: F) -> F
-where
-    F: Fn(&mut T) -> &mut T,
-{
-    val
 }
 
 /// load the WASM component and return the instance
@@ -278,4 +278,25 @@ async fn main() -> Result<()> {
     println!("Time taken for 10 iterations: {:?}", duration);
 
     Ok(())
+}
+
+/// Utility function for helping get around issues with rustc inference
+///
+/// see: https://github.com/bytecodealliance/wasmtime/blob/40eea8ee4c4d19f80f790c3ad4d9c4f0bf6aec55/crates/wasi/src/lib.rs#L431
+fn type_annotate<T: WasiView, F>(val: F) -> F
+where
+    F: Fn(&mut T) -> WasiImpl<&mut T>,
+{
+    val
+}
+
+/// Utility function for helping get around issues with rustc inference,
+/// but this time exposing just the pointer itself
+///
+/// see: https://github.com/bytecodealliance/wasmtime/blob/40eea8ee4c4d19f80f790c3ad4d9c4f0bf6aec55/crates/wasi/src/lib.rs#L431
+fn type_annotate_plain<T: WasiView, F>(val: F) -> F
+where
+    F: Fn(&mut T) -> &mut T,
+{
+    val
 }
