@@ -1,5 +1,9 @@
 package example:reconciler@0.1.0;
 
+interface retrieve {
+   get: func(name: string) -> string;
+}
+
 /// Represents the reconciler world
 world reconciler {
     //import wasi:cli/stdout@0.2.0;
@@ -14,6 +18,8 @@ world reconciler {
     import wasi:io/streams@0.2.0;
     import wasi:io/poll@0.2.0;
 
+    import retrieve;
+
     record reconcile-result {
         requeue: bool,
         requeue-after: u32,
@@ -24,9 +30,8 @@ world reconciler {
         code: u32,
         message: string,
     }
+
     /// The `reconcile` function is the main entry point for the reconciler.
     /// It takes a JSON input and returns a JSON output or an error.
     export reconcile: func(object: string) -> result<reconcile-result, reconcile-error>;
-
-    import get: func(name: string) -> string;
 }
