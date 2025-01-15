@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::async_trait;
+use wasmtime_wasi::{async_trait, WasiImpl};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiView};
 
 mod bindings {
@@ -21,7 +21,7 @@ mod bindings {
     });
 }
 
-use bindings::{Reconciler, ReconcileError, ReconcileResult};
+use bindings::{ReconcileError, ReconcileResult, Reconciler};
 
 /// This state is used by the Runtime host,
 /// we use it to store the WASI context (implementations of WASI)
@@ -37,7 +37,27 @@ struct Ctx {
 
 impl Ctx {
     pub fn new() -> Self {
-        let wasi = WasiCtx::builder().inherit_stdio().build();
+        // NOTE: `inherit_env()` causes all the host environment variables to be visible to the host,
+        // and if you use the WASI implementation provided (by wasmtime_wasi), all env vars would be
+        // available to all components.
+        //
+        // What this code does (later in `main`) is control this exposure at *link* time, but
+        // having the implementation filled by `Ctx` *not* the `Ctx#wasi` (which is a `WasiCtx`).
+        //
+        // This means that rather than go to the default code (provided by wasmtime_wasi), the linker hit the
+        // implementation in this file attached to `Ctx`.
+        //
+        // If we knew we want to *never* use the underlying host's ENV, it would be a better idea to
+        // remove the `inherit_env()` completely.
+        //
+        // The advantage of this setup is that you can have dynamic, filtered, or mediated access
+        // to the host environment -- from the impl on `Ctx` -- this means that you could expose a filtered
+        // list of environment variables that were available at host startup, nothing, or anything in between.
+        //
+        // You could do something like only allowing access to the full list of ENV variables *once* for a component,
+        // and all you would need is some extra state on `Ctx`.
+        //
+        let wasi = WasiCtx::builder().inherit_stdio().inherit_env().build();
         Self {
             wasi,
             table: ResourceTable::new(),
@@ -45,15 +65,9 @@ impl Ctx {
     }
 }
 
-// NOTE: you need to use async_trait mostly because that's what the bindings use
-//
-// Unfortunately auto-complete/ cargo-expand will show you a trait *after* async_trait
-// has had it's way with it -- so that's why you get obtusely named lifetimes and hard
-// to read code for humans.
-#[async_trait]
-impl bindings::example::reconciler::retrieve::Host for Ctx {
-    async fn get(&mut self, s: String) -> String {
-        format!("Hello {s}!")
+impl Debug for Ctx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ctx").field("runtime", &"wasmtime").finish()
     }
 }
 
@@ -67,9 +81,33 @@ impl WasiView for Ctx {
     }
 }
 
-impl Debug for Ctx {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Ctx").field("runtime", &"wasmtime").finish()
+
+/// Custom implementation of *only* the environment bit of
+/// wasi:cli, for our Host context object (`Ctx`)
+impl wasmtime_wasi::bindings::cli::environment::Host for Ctx {
+    fn get_environment(&mut self) -> wasmtime::Result<Vec<(String, String)>> {
+        // Components will only ever get *this* list of environment variables
+        Ok(vec![("STATIC".into(), "LIST!".into())])
+    }
+
+    fn get_arguments(&mut self) -> wasmtime::Result<Vec<String>> {
+        todo!()
+    }
+
+    fn initial_cwd(&mut self) -> wasmtime::Result<Option<String>> {
+        todo!()
+    }
+}
+
+// NOTE: you need to use async_trait mostly because that's what the bindings use
+//
+// Unfortunately auto-complete/ cargo-expand will show you a trait *after* async_trait
+// has had it's way with it -- so that's why you get obtusely named lifetimes and hard
+// to read code for humans.
+#[async_trait]
+impl bindings::example::reconciler::retrieve::Host for Ctx {
+    async fn get(&mut self, s: String) -> String {
+        format!("Hello {s}!")
     }
 }
 
@@ -91,10 +129,74 @@ async fn load_reconciler_instance(path: PathBuf) -> Result<(Store<Ctx>, bindings
 
     // Set up the linker for linking interfaces
     let mut linker = Linker::new(&engine);
+    let get_wasi_impl = type_annotate(|ctx| WasiImpl(ctx));
+    let get_ctx = type_annotate_plain(|ctx| ctx);
 
-    // Add WASI implementations to the linker for components to use
-    wasmtime_wasi::add_to_linker_async(&mut linker)
-        .context("failed to link core WASI interfaces")?;
+    // Add WASI implementations (*execpt* environment) to the linker for components to use
+    //
+    // Rather than doing the below:
+    // wasmtime_wasi::add_to_linker_async(&mut linker)
+    //     .context("failed to link core WASI interfaces")?;
+    //
+    // We will add all the functionality *except* what we want to mock out
+    wasmtime_wasi::bindings::clocks::wall_clock::add_to_linker_get_host(
+        &mut linker,
+        get_wasi_impl,
+    )?;
+    wasmtime_wasi::bindings::clocks::monotonic_clock::add_to_linker_get_host(
+        &mut linker,
+        get_wasi_impl,
+    )?;
+    wasmtime_wasi::bindings::filesystem::types::add_to_linker_get_host(&mut linker, get_wasi_impl)?;
+    wasmtime_wasi::bindings::filesystem::preopens::add_to_linker_get_host(
+        &mut linker,
+        get_wasi_impl,
+    )?;
+    wasmtime_wasi::bindings::io::error::add_to_linker_get_host(&mut linker, get_wasi_impl)?;
+    wasmtime_wasi::bindings::io::poll::add_to_linker_get_host(&mut linker, get_wasi_impl)?;
+    wasmtime_wasi::bindings::io::streams::add_to_linker_get_host(&mut linker, get_wasi_impl)?;
+    wasmtime_wasi::bindings::random::random::add_to_linker_get_host(&mut linker, get_wasi_impl)?;
+    wasmtime_wasi::bindings::random::insecure::add_to_linker_get_host(&mut linker, get_wasi_impl)?;
+    wasmtime_wasi::bindings::random::insecure_seed::add_to_linker_get_host(
+        &mut linker,
+        get_wasi_impl,
+    )?;
+    wasmtime_wasi::bindings::cli::stdin::add_to_linker_get_host(&mut linker, get_wasi_impl)?;
+    wasmtime_wasi::bindings::cli::stdout::add_to_linker_get_host(&mut linker, get_wasi_impl)?;
+    wasmtime_wasi::bindings::cli::stderr::add_to_linker_get_host(&mut linker, get_wasi_impl)?;
+    wasmtime_wasi::bindings::cli::terminal_input::add_to_linker_get_host(
+        &mut linker,
+        get_wasi_impl,
+    )?;
+    wasmtime_wasi::bindings::cli::terminal_output::add_to_linker_get_host(
+        &mut linker,
+        get_wasi_impl,
+    )?;
+    wasmtime_wasi::bindings::cli::terminal_stdin::add_to_linker_get_host(
+        &mut linker,
+        get_wasi_impl,
+    )?;
+    wasmtime_wasi::bindings::cli::terminal_stdout::add_to_linker_get_host(
+        &mut linker,
+        get_wasi_impl,
+    )?;
+    wasmtime_wasi::bindings::cli::terminal_stderr::add_to_linker_get_host(
+        &mut linker,
+        get_wasi_impl,
+    )?;
+    wasmtime_wasi::bindings::cli::exit::add_to_linker_get_host(
+        &mut linker,
+        &wasmtime_wasi::bindings::cli::exit::LinkOptions::default(),
+        get_wasi_impl,
+    )?;
+
+    // We're going to have a custom impl, instead of the WasiImpl(T) derived one, so instead of using the closure
+    // that gets us a WasiImpl(T), we'll use our own T
+    //
+    // wasmtime_wasi::bindings::cli::environment::add_to_linker_get_host(&mut linker, closure)?;
+    //
+    //
+    wasmtime_wasi::bindings::cli::environment::add_to_linker_get_host(&mut linker, get_ctx)?;
 
     // Add host-backed support for the `retrieve` interface to the linker
     bindings::example::reconciler::retrieve::add_to_linker(&mut linker, |ctx| ctx)
@@ -176,4 +278,25 @@ async fn main() -> Result<()> {
     println!("Time taken for 10 iterations: {:?}", duration);
 
     Ok(())
+}
+
+/// Utility function for helping get around issues with rustc inference
+///
+/// see: https://github.com/bytecodealliance/wasmtime/blob/40eea8ee4c4d19f80f790c3ad4d9c4f0bf6aec55/crates/wasi/src/lib.rs#L431
+fn type_annotate<T: WasiView, F>(val: F) -> F
+where
+    F: Fn(&mut T) -> WasiImpl<&mut T>,
+{
+    val
+}
+
+/// Utility function for helping get around issues with rustc inference,
+/// but this time exposing just the pointer itself
+///
+/// see: https://github.com/bytecodealliance/wasmtime/blob/40eea8ee4c4d19f80f790c3ad4d9c4f0bf6aec55/crates/wasi/src/lib.rs#L431
+fn type_annotate_plain<T: WasiView, F>(val: F) -> F
+where
+    F: Fn(&mut T) -> &mut T,
+{
+    val
 }
